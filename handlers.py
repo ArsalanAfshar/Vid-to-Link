@@ -363,6 +363,20 @@ async def handle_url_message(event: Message, user_id: int, username: Optional[st
         await _handle_generic_url(event, user_id, username, url, platform_name)
 
 
+def _is_bot_check_error(exc: BaseException) -> bool:
+    """Detect if an error is YouTube's bot challenge / sign-in requirement."""
+    msg = str(exc).lower()
+    return any(
+        hint in msg
+        for hint in (
+            "confirm you're not a bot",
+            "confirm you’re not a bot",
+            "sign in to confirm",
+            "bot check",
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # Generic Path (yt-dlp): YouTube, TikTok, Reddit, Vimeo, Facebook, etc.
 # ---------------------------------------------------------------------------
@@ -373,7 +387,13 @@ async def _handle_generic_url(event: Message, user_id: int, username: Optional[s
     try:
         info = await downloader.extract_video_info(url)
     except downloader.ExtractionError as exc:
-        await safe_edit(status_msg, "error_extraction_failed", error=str(exc))
+        if _is_bot_check_error(exc):
+            bot_text = messages.get("error_youtube_bot_check")
+            if is_owner(user_id):
+                bot_text += "\n\n🔑 **نکته مدیر:** فایل `cookies.txt` را همینجا ارسال نمایید تا کوکی‌ها به طور خودکار فعال شوند."
+            await status_msg.edit(bot_text)
+        else:
+            await safe_edit(status_msg, "error_extraction_failed", error=str(exc))
         _log(EventType.DOWNLOAD_FAILED, user_id, username, platform=platform_hint, url=url, error=str(exc))
         return
 
@@ -506,7 +526,13 @@ async def _run_download_and_deliver(
             _cleanup_task(user_id, keep_temp=False)
             return
         except downloader.DownloadFailedError as exc:
-            await safe_edit(msg, "error_download_failed", error=str(exc))
+            if _is_bot_check_error(exc):
+                bot_text = messages.get("error_youtube_bot_check")
+                if is_owner(user_id):
+                    bot_text += "\n\n🔑 **نکته مدیر:** فایل `cookies.txt` را همینجا ارسال نمایید تا کوکی‌ها به طور خودکار فعال شوند."
+                await msg.edit(bot_text)
+            else:
+                await safe_edit(msg, "error_download_failed", error=str(exc))
             _log(EventType.DOWNLOAD_FAILED, user_id, username, platform=info.platform, url=url, quality=quality.label, error=str(exc))
             if on_failure:
                 await on_failure(str(exc))
@@ -881,6 +907,7 @@ async def cmd_admin(event: Message) -> None:
         "🛠 **پنل مدیریت ربات Vid-to-Link**\n\n"
         "دستورات مدیریت:\n"
         "/expiration — ⏳ تنظیم مدت زمان اعتبار لینک‌ها و فایل‌ها\n"
+        "/cookies — 🍪 مشاهده وضعیت و راهنمای کوکی‌های یوتیوب\n"
         "/storage — 💾 وضعیت دیسک ریل‌وی و اجرای پاکسازی فوری\n"
         "/limits — ⚙️ تنظیم سقف حجم و دانلودهای همزمان\n"
         "/stats — 📊 آمار کاربران و تعداد دانلودها\n"
@@ -888,9 +915,50 @@ async def cmd_admin(event: Message) -> None:
     )
     buttons = [
         [Button.inline("⏳ مدت اعتبار فایل‌ها", "exp|menu"), Button.inline("💾 حافظه و دیسک", "stor|refresh")],
-        [Button.inline("⚙️ محدودیت‌های دانلود", "lim|menu"), Button.inline("📊 آمار کلی", "adm|stats")],
+        [Button.inline("⚙️ محدودیت‌های دانلود", "lim|menu"), Button.inline("🍪 وضعیت کوکی‌ها", "adm|cookies")],
+        [Button.inline("📊 آمار کلی", "adm|stats")],
     ]
     await event.respond(text, buttons=buttons)
+
+
+async def cmd_cookies(event: Message) -> None:
+    if not is_owner(event.sender_id):
+        return
+    stats = downloader.get_cookie_stats()
+    if stats["has_cookies"]:
+        domains_str = ", ".join(stats["domains"][:8])
+        if len(stats["domains"]) > 8:
+            domains_str += f" و {len(stats['domains']) - 8} دامنه دیگر"
+        msg = (
+            "🍪 **وضعیت کوکی‌های سیستم:**\n\n"
+            "✅ **فعال و آماده استفاده**\n"
+            f"📊 تعداد کل کوکی‌ها: **{stats['count']}**\n"
+            f"📁 منبع: `{stats['source']}`\n"
+            f"🌐 دامنه‌ها: `{domains_str}`\n\n"
+            "💡 برای به‌روزرسانی کافیست فایل جدید `cookies.txt` را مستقیماً در همین چت ارسال نمایید.\n"
+            "🗑 برای پاکسازی: /clearcookies"
+        )
+    else:
+        msg = (
+            "🍪 **وضعیت کوکی‌های سیستم:**\n\n"
+            "❌ **هیچ کوکی فعالی یافت نشد!**\n\n"
+            "برای رفع خطای «Sign in to confirm you’re not a bot» در یوتیوب:\n"
+            "1️⃣ افزونه **Get cookies.txt LOCALLY** را در مرورگر خود نصب کنید.\n"
+            "2️⃣ در حالت ناشناس (Incognito) وارد یوتیوب شوید.\n"
+            "3️⃣ فایل کوکی را دانلود کرده و فایل `cookies.txt` را مستقیماً برای همین ربات ارسال نمایید.\n\n"
+            "💡 همچنین می‌توانید کوکی‌ها را در متغیر محیطی `YOUTUBE_COOKIES_B64` در پنل Railway قرار دهید."
+        )
+    await event.respond(msg)
+
+
+async def cmd_clear_cookies(event: Message) -> None:
+    if not is_owner(event.sender_id):
+        return
+    cleared = downloader.clear_saved_cookies()
+    if cleared:
+        await event.respond("🗑 تمام فایل‌های کوکی محلی با موفقیت حذف شدند.")
+    else:
+        await event.respond("ℹ️ هیچ فایل کوکی محلی برای حذف وجود نداشت.")
 
 
 async def cmd_expiration(event: Message) -> None:
@@ -984,6 +1052,34 @@ def register_handlers(client: TelegramClient) -> None:
                 )
                 return
 
+        # Check if owner uploaded a cookie file (.txt)
+        if is_owner(sender.id) and event.message.media:
+            file_name = event.file.name if event.file else ""
+            if file_name and (file_name.lower().endswith(".txt") or "cookie" in file_name.lower()):
+                try:
+                    content_bytes = await event.download_media(bytes)
+                    if content_bytes:
+                        content_str = content_bytes.decode("utf-8", errors="replace")
+                        success, count, domains = downloader.save_cookies_text(content_str)
+                        if success:
+                            domains_preview = ", ".join(domains[:5])
+                            if len(domains) > 5:
+                                domains_preview += f" و {len(domains) - 5} دامنه دیگر"
+                            await event.respond(
+                                f"✅ **فایل کوکی با موفقیت دریافت و ذخیره شد!**\n\n"
+                                f"🍪 تعداد کوکی‌های فعال: **{count}**\n"
+                                f"🌐 دامنه‌ها: `{domains_preview}`\n\n"
+                                "از این پس دانلودهای یوتیوب و سایر سرویس‌ها با این کوکی‌ها انجام خواهند شد."
+                            )
+                            return
+                        else:
+                            await event.respond("❌ فایل ارسالی فرمت معتبر کوکی Netscape را ندارد.")
+                            return
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("Error processing uploaded cookie file")
+                    await event.respond(f"❌ خطا در پردازش فایل کوکی: {exc}")
+                    return
+
         try:
             if text.startswith("/start"):
                 await cmd_start(event)
@@ -1001,6 +1097,10 @@ def register_handlers(client: TelegramClient) -> None:
                 await cmd_about(event)
             elif text.startswith("/admin") and is_owner(sender.id):
                 await cmd_admin(event)
+            elif text.startswith("/cookies") and is_owner(sender.id):
+                await cmd_cookies(event)
+            elif text.startswith("/clearcookies") and is_owner(sender.id):
+                await cmd_clear_cookies(event)
             elif text.startswith("/expiration") and is_owner(sender.id):
                 await cmd_expiration(event)
             elif text.startswith("/storage") and is_owner(sender.id):
@@ -1080,6 +1180,13 @@ def register_handlers(client: TelegramClient) -> None:
                         f"👥 کاربران: {stats['total_users']} | 📥 کل: {stats['total_downloads']}\n"
                         f"✅ موفق: {stats['successful_downloads']} | ❌ ناموفق: {stats['failed_downloads']}\n"
                         f"📂 فایل‌های فعال: {storage['active_count']}",
+                        alert=True,
+                    )
+                elif prefix == "adm" and len(parts) > 1 and parts[1] == "cookies":
+                    stats = downloader.get_cookie_stats()
+                    status_str = f"فعال ({stats['count']} عدد)" if stats["has_cookies"] else "غیرفعال"
+                    await event.answer(
+                        f"🍪 وضعیت کوکی‌ها: {status_str}\nبرای جزئیات و راهنما /cookies را بفرستید.",
                         alert=True,
                     )
             else:

@@ -26,7 +26,9 @@ import admin_settings
 import cleanup_worker
 import config
 import database
+import downloader
 import file_server
+import handlers
 import utils
 
 
@@ -280,12 +282,87 @@ async def test_time_parser():
     print("  -> Time parser tests passed!")
 
 
+async def test_cookies_and_bot_bypass():
+    print("Testing YouTube cookies and bot bypass helpers...")
+    import base64
+
+    # 1. Cookie line normalization (space vs tab separation)
+    space_line = ".youtube.com   TRUE   /   TRUE   1790000000   SID   test_cookie_value"
+    norm = downloader._normalize_cookie_line(space_line)
+    assert "\t" in norm
+    parts = norm.split("\t")
+    assert len(parts) == 7
+    assert parts[0] == ".youtube.com"
+    assert parts[5] == "SID"
+
+    # 2. HttpOnly cookie line preservation
+    httponly_line = "#HttpOnly_.youtube.com   TRUE   /   TRUE   1790000000   HSID   httponly_val"
+    norm_http = downloader._normalize_cookie_line(httponly_line)
+    assert norm_http.startswith("#HttpOnly_.youtube.com\t")
+
+    # 3. Save cookie text and get stats
+    sample_cookies = (
+        "# Netscape HTTP Cookie File\n"
+        ".youtube.com\tTRUE\t/\tTRUE\t1890000000\tSID\tsid_12345\n"
+        ".youtube.com\tTRUE\t/\tTRUE\t1890000000\tHSID\thsid_67890\n"
+        ".google.com\tTRUE\t/\tFALSE\t1890000000\tSSID\tss_val\n"
+    )
+    success, count, domains = downloader.save_cookies_text(sample_cookies)
+    assert success is True
+    assert count == 3
+    assert ".youtube.com" in domains
+
+    stats = downloader.get_cookie_stats()
+    assert stats["has_cookies"] is True
+    assert stats["count"] == 3
+    assert ".youtube.com" in stats["domains"]
+
+    # 4. Client attempts ordering
+    clients_no_cookies = downloader._client_attempts(has_cookies=False)
+    # Without cookies, bot-bypass clients come first before None
+    assert clients_no_cookies[0] == ["tv_simply", "tv_downgraded"]
+    assert None in clients_no_cookies
+
+    clients_with_cookies = downloader._client_attempts(has_cookies=True)
+    # With cookies, default clients (None) come first
+    assert clients_with_cookies[0] is None
+
+    # 5. Base64 cookie loading test
+    raw_cookie_b64 = base64.b64encode(sample_cookies.encode("utf-8")).decode("utf-8")
+    os.environ["YOUTUBE_COOKIES_B64"] = raw_cookie_b64
+    cookie_file = downloader._get_cookie_file()
+    assert cookie_file is not None
+    assert os.path.exists(cookie_file)
+    del os.environ["YOUTUBE_COOKIES_B64"]
+
+    # 6. Proxy and PO Token injection into yt-dlp options
+    os.environ["YOUTUBE_PROXY"] = "http://127.0.0.1:8080"
+    os.environ["YOUTUBE_PO_TOKEN"] = "web.player+test_po_token"
+    opts = downloader._base_ydl_opts(player_clients=["tv_simply"])
+    assert opts["proxy"] == "http://127.0.0.1:8080"
+    assert opts["extractor_args"]["youtube"]["player_client"] == ["tv_simply"]
+    assert opts["extractor_args"]["youtube"]["po_token"] == ["web.player+test_po_token"]
+    del os.environ["YOUTUBE_PROXY"]
+    del os.environ["YOUTUBE_PO_TOKEN"]
+
+    # 7. Bot check error detection helper
+    bot_err = Exception("ERROR: [youtube] soHxabShSaE: Sign in to confirm you’re not a bot. Use --cookies for authentication.")
+    other_err = Exception("Video unavailable")
+    assert handlers._is_bot_check_error(bot_err) is True
+    assert handlers._is_bot_check_error(other_err) is False
+
+    # Cleanup saved cookies
+    downloader.clear_saved_cookies()
+    print("  -> YouTube cookies and bot bypass tests passed!")
+
+
 async def main():
     await test_database_and_links()
     await test_file_expiration_and_cleanup()
     await test_http_server()
     await test_admin_settings()
     await test_time_parser()
+    await test_cookies_and_bot_bypass()
     print("\n🎉 ALL TESTS PASSED SUCCESSFULLY! 🎉")
 
 

@@ -119,8 +119,43 @@ Copy `.env.example` to `.env` or set these in Railway Variables:
 | `COOLDOWN_ENABLED` | `false` | Enable cooldown periods after consecutive downloads. |
 | `PORNHUB_ENABLED` | `true` | Toggle PornHub support. |
 | `PORNHUB_NOTIFY_ADMIN`| `true` | Notify owner when adult content is downloaded. |
-| `YOUTUBE_COOKIES` | `""` | Netscape cookies string for YouTube bypass. |
+| `YOUTUBE_COOKIES_B64` | `""` | Base64-encoded Netscape cookies string (safest for Railway). |
+| `YOUTUBE_COOKIES` | `""` | Raw Netscape cookies string for YouTube bypass. |
+| `YOUTUBE_COOKIES_FILE`| `""` | Path to cookies.txt on disk/volume. |
+| `YOUTUBE_PROXY` | `""` | HTTP/SOCKS5 proxy for YouTube (e.g. `socks5://user:pass@host:port`). |
+| `YOUTUBE_PO_TOKEN` | `""` | Manual Proof-of-Origin token override for YouTube. |
 | `INSTAGRAM_COOKIES` | `""` | Netscape cookies string for Instagram. |
+
+---
+
+## 🍪 Fixing YouTube "Sign in to confirm you're not a bot" on Railway
+
+### Why does this happen?
+Railway runs on cloud datacenter IP ranges (GCP / AWS). YouTube aggressively detects requests originating from cloud datacenters and requires authentication or Proof-of-Origin tokens for anonymous traffic.
+
+### Solution 1: Send `cookies.txt` directly to your Telegram Bot (Easiest & Fastest!)
+You do **not** need to restart or redeploy your container:
+1. Install the **Get cookies.txt LOCALLY** extension in your browser ([Chrome](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc) / [Firefox](https://addons.mozilla.org/en-US/firefox/addon/cookies-txt/)).
+2. Open YouTube in an **Incognito / Private window** and sign into any Google/YouTube account.
+3. Click the extension icon and download `cookies.txt`.
+4. Close the incognito window (do not sign out).
+5. **Drag and drop the `cookies.txt` file directly into your Telegram bot chat as the bot owner!**
+6. Vid-to-Link validates the Netscape format, activates the cookies instantly in runtime, and confirms with a message showing the active cookie count and domains.
+
+### Solution 2: Railway Environment Variable (`YOUTUBE_COOKIES_B64`)
+To preserve cookies across fresh deployments without file uploads:
+1. Convert your `cookies.txt` file to a single base64 string:
+   ```bash
+   base64 -w 0 cookies.txt
+   ```
+   *(On macOS: `base64 -i cookies.txt`)*
+2. In Railway, open your service → **Variables**.
+3. Add `YOUTUBE_COOKIES_B64` and paste the base64 string.
+4. Vid-to-Link automatically decodes, normalizes, and loads the cookies on boot.
+
+### Solution 3: Route YouTube through a Proxy
+If you prefer not to use cookies, route YouTube extractor traffic through a residential or IPv4 proxy:
+- Set `YOUTUBE_PROXY=socks5://user:pass@proxy-host:1080` in Railway Variables.
 
 ---
 

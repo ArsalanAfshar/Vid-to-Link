@@ -144,10 +144,23 @@ PINTEREST_ENABLED: bool = _get_bool("PINTEREST_ENABLED", True)
 INSTAGRAM_ENABLED: bool = _get_bool("INSTAGRAM_ENABLED", True)
 TWITTER_ENABLED: bool = _get_bool("TWITTER_ENABLED", True)
 
-# Optional Netscape cookies
+# Optional Netscape cookies and YouTube bot bypass
 INSTAGRAM_COOKIES: str = os.getenv("INSTAGRAM_COOKIES", "").strip()
 YOUTUBE_COOKIES: str = os.getenv("YOUTUBE_COOKIES", "").strip()
+YOUTUBE_COOKIES_B64: str = os.getenv("YOUTUBE_COOKIES_B64", "").strip()
+YOUTUBE_COOKIES_FILE: str = os.getenv("YOUTUBE_COOKIES_FILE", "").strip()
+COOKIES_FILE: str = os.getenv("COOKIES_FILE", "").strip()
+COOKIES_B64: str = os.getenv("COOKIES_B64", "").strip()
 EXTRA_COOKIES: str = os.getenv("EXTRA_COOKIES", "").strip()
+
+# Optional proxy for YouTube / yt-dlp
+YOUTUBE_PROXY: str = os.getenv("YOUTUBE_PROXY", "").strip()
+DOWNLOADER_PROXY: str = os.getenv("DOWNLOADER_PROXY", "").strip()
+
+# Optional Proof-of-Origin (PO) Token overrides
+YOUTUBE_PO_TOKEN: str = os.getenv("YOUTUBE_PO_TOKEN", "").strip()
+YOUTUBE_VISITOR_DATA: str = os.getenv("YOUTUBE_VISITOR_DATA", "").strip()
+YOUTUBE_PLAYER_CLIENTS: str = os.getenv("YOUTUBE_PLAYER_CLIENTS", "").strip()
 
 # SoundCloud playlist track limit
 MAX_PLAYLIST_TRACKS: int = _get_int("MAX_PLAYLIST_TRACKS", 100)

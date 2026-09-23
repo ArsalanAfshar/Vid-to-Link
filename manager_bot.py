@@ -163,6 +163,8 @@ async def _cmd_start(event) -> None:
         "🛠 **Vid-to-Link Manager Bot**\n\n"
         "Commands:\n"
         "/expiration — ⏳ Configure file retention & expiration duration\n"
+        "/cookies — 🍪 View or upload YouTube cookies (bypasses bot check)\n"
+        "/clearcookies — 🗑 Clear stored cookie files\n"
         "/storage — 💾 View disk space & active files + run cleanup\n"
         "/limits — ⚙️ Download limits (max size, concurrency, cooldown)\n"
         "/stats — 📊 Bot statistics & total downloads\n"
@@ -514,6 +516,51 @@ async def _cmd_broadcast(event, main_client: TelegramClient) -> None:
 # ---------------------------------------------------------------------------
 # Dispatcher & Callback Registrations
 # ---------------------------------------------------------------------------
+async def _cmd_cookies(event) -> None:
+    if not _is_admin(event.sender_id):
+        return
+    import downloader
+
+    stats = downloader.get_cookie_stats()
+    if stats["has_cookies"]:
+        domains_str = ", ".join(stats["domains"][:8])
+        if len(stats["domains"]) > 8:
+            domains_str += f" and {len(stats['domains']) - 8} more"
+        msg = (
+            "🍪 **System Cookie Status**\n\n"
+            "✅ **Active and Loaded**\n"
+            f"• Cookie Count: **{stats['count']}**\n"
+            f"• Source: `{stats['source']}`\n"
+            f"• Domains: `{domains_str}`\n\n"
+            "💡 **How to update:** Send a fresh `cookies.txt` file directly into this chat.\n"
+            "🗑 **To clear:** /clearcookies"
+        )
+    else:
+        msg = (
+            "🍪 **System Cookie Status**\n\n"
+            "❌ **No cookies currently loaded.**\n\n"
+            "To bypass YouTube bot challenges ('Sign in to confirm you’re not a bot'):\n"
+            "1. Install the **Get cookies.txt LOCALLY** browser extension (Chrome/Firefox).\n"
+            "2. Open YouTube in an Incognito/Private window and sign in.\n"
+            "3. Export the Netscape cookies file.\n"
+            "4. Send the `cookies.txt` file directly to this bot!\n\n"
+            "Alternatively, set the `YOUTUBE_COOKIES_B64` variable in Railway with `base64 -w 0 cookies.txt`."
+        )
+    await event.respond(msg)
+
+
+async def _cmd_clearcookies(event) -> None:
+    if not _is_admin(event.sender_id):
+        return
+    import downloader
+
+    cleared = downloader.clear_saved_cookies()
+    if cleared:
+        await event.respond("🗑 All local cookie files have been successfully deleted.")
+    else:
+        await event.respond("ℹ️ No local cookie files were found to delete.")
+
+
 def register_manager_handlers(manager_client: TelegramClient, main_client: TelegramClient) -> None:
     """Register all Manager Bot event handlers."""
 
@@ -549,6 +596,36 @@ def register_manager_handlers(manager_client: TelegramClient, main_client: Teleg
                     await event.respond(f"✅ Message `{key}` has been updated!")
                     return
 
+        # Check if admin uploaded a cookie file (.txt)
+        if event.message.media:
+            file_name = event.file.name if event.file else ""
+            if file_name and (file_name.lower().endswith(".txt") or "cookie" in file_name.lower()):
+                try:
+                    import downloader
+
+                    content_bytes = await event.download_media(bytes)
+                    if content_bytes:
+                        content_str = content_bytes.decode("utf-8", errors="replace")
+                        success, count, domains = downloader.save_cookies_text(content_str)
+                        if success:
+                            domains_preview = ", ".join(domains[:5])
+                            if len(domains) > 5:
+                                domains_preview += f" and {len(domains) - 5} more"
+                            await event.respond(
+                                f"✅ **Cookie file saved successfully!**\n\n"
+                                f"🍪 Active cookies: **{count}**\n"
+                                f"🌐 Domains: `{domains_preview}`\n\n"
+                                "YouTube and other platform downloads will now use these authenticated credentials."
+                            )
+                            return
+                        else:
+                            await event.respond("❌ The uploaded file is not in valid Netscape HTTP cookie format.")
+                            return
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("Error processing uploaded cookie file")
+                    await event.respond(f"❌ Error processing cookie file: {exc}")
+                    return
+
         text = (event.raw_text or "").strip()
         cmd = text.split()[0].lower() if text else ""
 
@@ -560,6 +637,10 @@ def register_manager_handlers(manager_client: TelegramClient, main_client: Teleg
             await _cmd_stats(event)
         elif cmd == "/logs":
             await _cmd_logs(event)
+        elif cmd == "/cookies":
+            await _cmd_cookies(event)
+        elif cmd == "/clearcookies":
+            await _cmd_clearcookies(event)
         elif cmd == "/expiration":
             await _cmd_expiration(event)
         elif cmd == "/storage":

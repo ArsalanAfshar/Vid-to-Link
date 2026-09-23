@@ -78,10 +78,19 @@ logger = logging.getLogger(__name__)
 # Maximum number of qualities shown to the user
 MAX_QUALITY_OPTIONS = 8
 
+# Maximum number of qualities shown to the user
+MAX_QUALITY_OPTIONS = 8
+
 # Lowest height still considered a real, usable quality
 MIN_USABLE_HEIGHT = 144
 
 _COOKIE_FILE_PATH = "/tmp/downloader_cookies.txt"
+_PERSISTENT_COOKIE_FILES = (
+    Path("cookies.txt"),
+    Path("youtube_cookies.txt"),
+    Path("/app/cookies.txt"),
+    Path("/tmp/cookies.txt"),
+)
 
 
 def _env_list(name: str, default: list[str]) -> list[str]:
@@ -119,35 +128,134 @@ def _looks_transient(exc: BaseException) -> bool:
     return any(hint in text for hint in _TRANSIENT_ERROR_HINTS)
 
 
+def _normalize_cookie_line(line: str) -> Optional[str]:
+    """
+    Normalize a Netscape cookie line.
+
+    Converts space-separated columns to tab-separated if needed (common when
+    cookies are pasted into web form inputs that replace tabs with spaces),
+    and preserves #HttpOnly_ prefixes.
+    """
+    line = line.strip()
+    if not line:
+        return None
+
+    if line.startswith("#"):
+        if line.startswith("#HttpOnly_"):
+            prefix = "#HttpOnly_"
+            rest = line[len(prefix):].strip()
+            parts = [p for p in rest.split() if p]
+            if len(parts) == 7:
+                return prefix + "\t".join(parts)
+        return line
+
+    parts = [p for p in line.split() if p]
+    if len(parts) == 7:
+        return "\t".join(parts)
+
+    return line
+
+
+def _unescape_cookie_block(block: str) -> str:
+    """Unescape literal \\n and \\t if the text was passed through JSON or shell escapes."""
+    if "\\n" in block and "\n" not in block:
+        block = block.replace("\\r\\n", "\n").replace("\\n", "\n")
+    if "\\t" in block and "\t" not in block:
+        block = block.replace("\\t", "\t")
+    return block.strip("\"'")
+
+
+def _collect_cookie_sources() -> list[tuple[str, str]]:
+    """
+    Collect cookie content blocks from all configured sources:
+    1. Base64 environment variables (YOUTUBE_COOKIES_B64, COOKIES_B64)
+    2. Plaintext environment variables (YOUTUBE_COOKIES, EXTRA_COOKIES, COOKIES)
+    3. Files on disk (YOUTUBE_COOKIES_FILE, COOKIES_FILE, ./cookies.txt, etc.)
+    """
+    sources: list[tuple[str, str]] = []
+
+    # 1. Base64 env vars
+    import base64
+
+    for env_name in ("YOUTUBE_COOKIES_B64", "COOKIES_B64"):
+        raw_b64 = os.environ.get(env_name, "").strip()
+        if raw_b64:
+            try:
+                decoded = base64.b64decode(raw_b64).decode("utf-8", errors="replace")
+                if decoded.strip():
+                    sources.append((f"env:{env_name}", decoded))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to decode base64 cookie env %s: %s", env_name, exc)
+
+    # 2. Text env vars
+    for env_name in ("YOUTUBE_COOKIES", "EXTRA_COOKIES", "COOKIES"):
+        raw_text = os.environ.get(env_name, "").strip()
+        if raw_text:
+            sources.append((f"env:{env_name}", _unescape_cookie_block(raw_text)))
+
+    # 3. Explicit file env vars
+    for env_name in ("YOUTUBE_COOKIES_FILE", "COOKIES_FILE"):
+        filepath = os.environ.get(env_name, "").strip()
+        if filepath:
+            p = Path(filepath)
+            if p.is_file() and p.stat().st_size > 0:
+                try:
+                    sources.append((f"file:{filepath}", p.read_text(encoding="utf-8", errors="replace")))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Could not read cookie file %s: %s", filepath, exc)
+
+    # 4. Standard on-disk candidate files
+    for candidate in _PERSISTENT_COOKIE_FILES:
+        try:
+            if candidate.is_file() and candidate.stat().st_size > 0:
+                sources.append(
+                    (f"file:{candidate}", candidate.read_text(encoding="utf-8", errors="replace"))
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
+    return sources
+
+
 def _get_cookie_file() -> Optional[str]:
     """
-    Build a single cookies.txt file (Netscape format) from environment variables.
+    Build a single cookies.txt file (Netscape format) from environment variables
+    and local cookie files.
 
-    - YOUTUBE_COOKIES: YouTube cookies (bypass bot checks and
-      age/member-restricted videos).
-    - EXTRA_COOKIES: optional cookies for other platforms (e.g. PornHub,
-      Instagram, Twitter/X, ...) in the same Netscape format.
-
-    Both values (if present) are merged into a single file; since yt-dlp
-    filters cookies by domain, merging them into one file is completely
-    safe and every site only receives its own cookies.
+    Supports:
+    - YOUTUBE_COOKIES_B64 / COOKIES_B64: base64-encoded Netscape cookies (immune to Railway newline mangling).
+    - YOUTUBE_COOKIES / EXTRA_COOKIES / COOKIES: raw text Netscape cookies.
+    - YOUTUBE_COOKIES_FILE / COOKIES_FILE: path to a cookies.txt file.
+    - Local files: cookies.txt, youtube_cookies.txt, /tmp/cookies.txt.
     """
-
-    raw_blocks = [
-        os.environ.get("YOUTUBE_COOKIES", "").strip(),
-        os.environ.get("EXTRA_COOKIES", "").strip(),
-    ]
-    blocks = [b for b in raw_blocks if b]
-    if not blocks:
+    sources = _collect_cookie_sources()
+    if not sources:
         return None
 
     lines: list[str] = ["# Netscape HTTP Cookie File"]
-    for block in blocks:
-        for line in block.splitlines():
-            stripped = line.strip()
-            if not stripped or stripped.startswith("# Netscape"):
+    seen_entries: set[str] = set()
+
+    for _, content in sources:
+        unescaped = _unescape_cookie_block(content)
+        for raw_line in unescaped.splitlines():
+            norm = _normalize_cookie_line(raw_line)
+            if not norm or norm.startswith("# Netscape"):
                 continue
-            lines.append(line)
+            if norm.startswith("#") and not norm.startswith("#HttpOnly_"):
+                continue
+
+            # Deduplicate by key (domain, path, name)
+            parts = norm.split("\t")
+            if len(parts) >= 7:
+                cookie_key = f"{parts[0]}:{parts[2]}:{parts[5]}"
+                if cookie_key in seen_entries:
+                    continue
+                seen_entries.add(cookie_key)
+
+            lines.append(norm)
+
+    if len(lines) <= 1:
+        return None
 
     try:
         with open(_COOKIE_FILE_PATH, "w", encoding="utf-8") as f:
@@ -156,6 +264,101 @@ def _get_cookie_file() -> Optional[str]:
     except Exception as exc:  # noqa: BLE001
         logger.error("Cookie file creation failed: %s", exc)
         return None
+
+
+def get_cookie_stats() -> dict[str, Any]:
+    """Inspect active cookie configuration and return statistics."""
+    import http.cookiejar
+
+    cookie_file = _get_cookie_file()
+    if not cookie_file or not Path(cookie_file).exists():
+        return {
+            "has_cookies": False,
+            "count": 0,
+            "domains": [],
+            "source": None,
+        }
+
+    try:
+        cj = http.cookiejar.MozillaCookieJar(cookie_file)
+        cj.load(ignore_discard=True, ignore_expires=True)
+        domains = sorted({c.domain for c in cj})
+        sources = _collect_cookie_sources()
+        source_names = [s[0] for s in sources]
+        return {
+            "has_cookies": len(cj) > 0,
+            "count": len(cj),
+            "domains": domains,
+            "source": ", ".join(source_names) if source_names else "file",
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to parse cookie file for stats: %s", exc)
+        return {
+            "has_cookies": False,
+            "count": 0,
+            "domains": [],
+            "source": None,
+        }
+
+
+def save_cookies_text(content: str) -> tuple[bool, int, list[str]]:
+    """
+    Validate and save raw cookie text into a persistent cookies.txt file.
+    Returns (success, cookie_count, domains).
+    """
+    import http.cookiejar
+    import tempfile
+
+    unescaped = _unescape_cookie_block(content)
+    lines: list[str] = ["# Netscape HTTP Cookie File"]
+    for raw_line in unescaped.splitlines():
+        norm = _normalize_cookie_line(raw_line)
+        if norm and not norm.startswith("# Netscape"):
+            lines.append(norm)
+
+    if len(lines) <= 1:
+        return False, 0, []
+
+    # Validate syntax with temporary file
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tf:
+            tf.write("\n".join(lines) + "\n")
+            temp_path = tf.name
+
+        cj = http.cookiejar.MozillaCookieJar(temp_path)
+        cj.load(ignore_discard=True, ignore_expires=True)
+        count = len(cj)
+        domains = sorted({c.domain for c in cj})
+
+        if count == 0:
+            Path(temp_path).unlink(missing_ok=True)
+            return False, 0, []
+
+        # Save to persistent file in current working directory and /tmp
+        persistent_dest = Path("cookies.txt")
+        persistent_dest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        with open(_COOKIE_FILE_PATH, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+        Path(temp_path).unlink(missing_ok=True)
+        return True, count, domains
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Failed to validate and save cookies: %s", exc)
+        return False, 0, []
+
+
+def clear_saved_cookies() -> bool:
+    """Clear all saved cookie files from disk."""
+    cleared = False
+    for candidate in (_COOKIE_FILE_PATH, Path("cookies.txt"), Path("youtube_cookies.txt")):
+        p = Path(candidate)
+        if p.exists():
+            try:
+                p.unlink(missing_ok=True)
+                cleared = True
+            except Exception:  # noqa: BLE001
+                pass
+    return cleared
 
 
 class ExtractionError(Exception):
@@ -238,19 +441,18 @@ def _is_youtube_url(url: str) -> bool:
     return "youtube.com" in lowered or "youtu.be" in lowered
 
 
-def _client_attempts() -> list[Optional[list[str]]]:
+def _client_attempts(has_cookies: bool = False) -> list[Optional[list[str]]]:
     """
     List of different YouTube player_client combinations tried in order.
 
-    None means 'use yt-dlp's own defaults', which are
-    kept continuously up to date by its maintainers based on the latest
-    YouTube changes; in direct testing (with a PO Token provider) this mode
-    gave the best result (up to 4K with accurate size). Other combinations are just
-    fallbacks so that if YouTube temporarily blocks a specific client
-    (which happens a lot), the bot keeps working.
+    When cookies are present, yt-dlp's default clients (None) and authenticated
+    combinations work best and unlock full DASH / 4K qualities.
 
-    YOUTUBE_PLAYER_CLIENTS lets you override the first combination without
-    touching the code (e.g. when YouTube changes behaviour again).
+    When cookies are absent on a datacenter/cloud IP (e.g. Railway, AWS),
+    clients that trigger YouTube's 'Sign in to confirm you’re not a bot' wall
+    (notably default 'web' / 'web_safari') are deprioritized in favor of
+    clients known to bypass datacenter IP bot challenges ('tv_simply', 'android_vr',
+    'web_embedded', 'tv', 'mweb').
     """
 
     attempts: list[Optional[list[str]]] = []
@@ -259,16 +461,36 @@ def _client_attempts() -> list[Optional[list[str]]]:
     if env_override:
         attempts.append(env_override)
 
-    attempts.append(None)
+    if has_cookies:
+        if None not in attempts:
+            attempts.append(None)
+        for combo in (
+            ["web_embedded", "tv_downgraded", "web"],
+            ["tv_simply", "tv_downgraded"],
+            ["android_vr"],
+            ["tv", "web_safari"],
+            ["mweb"],
+            ["ios"],
+        ):
+            if combo not in attempts:
+                attempts.append(combo)
+    else:
+        for combo in (
+            ["tv_simply", "tv_downgraded"],
+            ["android_vr"],
+            ["web_embedded"],
+            ["tv"],
+            ["mweb"],
+            ["ios"],
+            ["android"],
+        ):
+            if combo not in attempts:
+                attempts.append(combo)
 
-    for combo in (
-        ["tv", "web_safari"],
-        ["tv", "web_safari", "android", "ios"],
-        ["web", "mweb"],
-        ["ios"],
-    ):
-        if combo not in attempts:
-            attempts.append(combo)
+        if None not in attempts:
+            attempts.append(None)
+        if ["tv", "web_safari"] not in attempts:
+            attempts.append(["tv", "web_safari"])
 
     return attempts
 
@@ -297,8 +519,42 @@ def _base_ydl_opts(player_clients: Optional[list[str]] = None) -> dict[str, Any]
         "format_sort": ["res", "fps", "size", "br", "codec:h264"],
     }
 
+    extractor_args: dict[str, dict[str, Any]] = {}
+
     if player_clients:
-        opts["extractor_args"] = {"youtube": {"player_client": player_clients}}
+        extractor_args.setdefault("youtube", {})["player_client"] = player_clients
+
+    po_token = os.environ.get("YOUTUBE_PO_TOKEN", "").strip()
+    visitor_data = os.environ.get("YOUTUBE_VISITOR_DATA", "").strip()
+    if po_token:
+        extractor_args.setdefault("youtube", {})["po_token"] = [po_token]
+    if visitor_data:
+        extractor_args.setdefault("youtube", {})["visitor_data"] = [visitor_data]
+
+    # Check for bgutil pot script provider directory if present
+    for pot_dir in (
+        Path.home() / "bgutil-ytdlp-pot-provider" / "server",
+        Path("/root/bgutil-ytdlp-pot-provider/server"),
+        Path("/app/bgutil-ytdlp-pot-provider/server"),
+    ):
+        try:
+            if pot_dir.exists():
+                extractor_args.setdefault("youtubepot-bgutilscript", {})["server_home"] = [str(pot_dir)]
+                break
+        except OSError:
+            pass
+
+    if extractor_args:
+        opts["extractor_args"] = extractor_args
+
+    proxy = (
+        os.environ.get("YOUTUBE_PROXY")
+        or os.environ.get("DOWNLOADER_PROXY")
+        or os.environ.get("HTTP_PROXY")
+        or os.environ.get("HTTPS_PROXY")
+    )
+    if proxy and proxy.strip():
+        opts["proxy"] = proxy.strip()
 
     cookie_file = _get_cookie_file()
     if cookie_file:
@@ -356,7 +612,9 @@ async def _extract_video_info_once(url: str) -> VideoInfo:
     """
     loop = asyncio.get_running_loop()
     is_youtube = _is_youtube_url(url)
-    attempts = _client_attempts() if is_youtube else [None]
+    cookie_file = _get_cookie_file()
+    has_cookies = cookie_file is not None
+    attempts = _client_attempts(has_cookies=has_cookies) if is_youtube else [None]
     last_error: Optional[BaseException] = None
 
     good_enough_height = _get_int_env("DOWNLOADER_GOOD_ENOUGH_HEIGHT", 1080)
@@ -660,7 +918,7 @@ def _clear_output_dir(out_dir: str) -> None:
 
 
 def _download_attempts(
-    quality: QualityOption, is_youtube: bool
+    quality: QualityOption, is_youtube: bool, has_cookies: bool = False
 ) -> list[tuple[str, Optional[list[str]]]]:
     """
     Download attempt chain: (format_selector, player_clients).
@@ -675,7 +933,7 @@ def _download_attempts(
         selector = "bestaudio/best"
         attempts.append((selector, None))
         if is_youtube:
-            for combo in (["tv", "web_safari"], ["ios"], ["android"]):
+            for combo in (["tv_simply"], ["tv", "web_safari"], ["ios"], ["android"]):
                 if (selector, combo) not in attempts:
                     attempts.append((selector, combo))
         return attempts
@@ -688,7 +946,7 @@ def _download_attempts(
             attempts.append((exact_selector, quality.clients))
 
         # 2. Try all known-good client combinations for the exact quality
-        for combo in _client_attempts():
+        for combo in _client_attempts(has_cookies=has_cookies):
             item = (exact_selector, combo)
             if item not in attempts:
                 attempts.append(item)
@@ -697,7 +955,12 @@ def _download_attempts(
         if quality.height:
             h = int(quality.height)
             height_selector = f"bestvideo[height={h}]+bestaudio/bestvideo[height>={h-40}][height<={h+40}]+bestaudio/bestvideo[height<={h}]+bestaudio"
-            for combo in (quality.clients, ["tv", "web_safari"], None):
+            fallback_combos = (
+                [quality.clients, ["tv_simply"], ["android_vr"], ["tv", "web_safari"], None]
+                if not has_cookies
+                else [quality.clients, None, ["web_embedded", "tv_downgraded", "web"], ["tv", "web_safari"]]
+            )
+            for combo in fallback_combos:
                 item = (height_selector, combo)
                 if item not in attempts:
                     attempts.append(item)
@@ -759,7 +1022,9 @@ async def _download_video_once(
                 pass
 
     is_youtube = _is_youtube_url(url)
-    attempts = _download_attempts(quality, is_youtube)
+    cookie_file = _get_cookie_file()
+    has_cookies = cookie_file is not None
+    attempts = _download_attempts(quality, is_youtube, has_cookies=has_cookies)
     loop = asyncio.get_running_loop()
     last_exc: Optional[BaseException] = None
 
