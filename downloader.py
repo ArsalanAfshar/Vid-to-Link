@@ -178,44 +178,38 @@ class QualityOption:
     height: Optional[int] = None
     filesize: Optional[int] = None
     format_id: Optional[str] = None
+    clients: Optional[list[str]] = None
 
-    def format_selector(self) -> str:
+    def exact_format_selector(self) -> str:
         """
-        Build a real, safe format selector string for yt-dlp.
-
-        The selection chain works like this:
-        1) The exact format_id identified/measured when qualities were listed
-           (guarantees the quality the user picked matches what is downloaded).
-        2) If that exact format is gone (e.g. the format list changed),
-           the best video at the same height + best audio.
-        3) Finally, the best quality available regardless of height, so the user never hits
-           'Requested format is not available'.
+        Build a strict format selector for the requested quality.
+        Ensures yt-dlp never silently downgrades 1080p/720p to a 360p progressive stream.
         """
-
         if self.kind == "audio":
             return "bestaudio/best"
 
         chain: list[str] = []
 
-        if self.format_id:
-            chain.append(
-                f"{self.format_id}+bestaudio[ext=m4a]/"
-                f"{self.format_id}+bestaudio/"
-                f"{self.format_id}"
-            )
-
-        if self.height:
+        if self.format_id and self.height:
             h = int(self.height)
-            chain.extend(
-                [
-                    f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]",
-                    f"bestvideo[height<={h}]+bestaudio",
-                    f"best[height<={h}]",
-                ]
-            )
+            chain.append(f"{self.format_id}+bestaudio")
+            chain.append(f"bestvideo[height={h}]+bestaudio")
+            chain.append(f"bestvideo[height>={h-40}][height<={h+40}]+bestaudio")
+            chain.append(f"{self.format_id}")
+        elif self.format_id:
+            chain.append(f"{self.format_id}+bestaudio")
+            chain.append(f"{self.format_id}")
+        elif self.height:
+            h = int(self.height)
+            chain.append(f"bestvideo[height={h}]+bestaudio")
+            chain.append(f"bestvideo[height>={h-40}][height<={h+40}]+bestaudio")
+        else:
+            chain.append("bestvideo+bestaudio/best")
 
-        chain.append("bestvideo+bestaudio/best")
         return "/".join(chain)
+
+    def format_selector(self) -> str:
+        return self.exact_format_selector()
 
 
 @dataclass
@@ -297,8 +291,10 @@ def _base_ydl_opts(player_clients: Optional[list[str]] = None) -> dict[str, Any]
         # 'The downloaded file is empty' is trying to fetch a format with one
         # error is one big continuous request getting cut off by YouTube throttling.
         "http_chunk_size": _get_int_env("DOWNLOADER_HTTP_CHUNK_MB", 10) * 1024 * 1024,
-        # Prefer the best resolution/codec/container when formats tie
-        "format_sort": ["res", "fps", "codec:h264", "ext:mp4:m4a", "+size", "+br"],
+        # Prefer the best resolution/fps/size/bitrate (descending = highest quality).
+        # NEVER use +size or +br, because in yt-dlp '+' reverses the sort to ascending
+        # (preferring the smallest file and lowest bitrate)!
+        "format_sort": ["res", "fps", "size", "br", "codec:h264"],
     }
 
     if player_clients:
@@ -415,6 +411,7 @@ async def _extract_video_info_once(url: str) -> VideoInfo:
             fmt_id = fmt.get("format_id")
             key = fmt_id if fmt_id is not None else id(fmt)
             if key not in merged_formats:
+                fmt["_source_clients"] = clients
                 merged_formats[key] = fmt
                 new_formats += 1
 
@@ -576,6 +573,7 @@ def _build_quality_options(info: dict[str, Any]) -> list[QualityOption]:
             "format_id": fmt.get("format_id"),
             "filesize": total_size or None,
             "tbr": float(fmt.get("tbr") or fmt.get("vbr") or 0),
+            "clients": fmt.get("_source_clients"),
             # Tie-break priority when multiple formats share a height: exact size known >
             # direct protocol (https) > compatible codec (avc1/h264) > higher bitrate
             "rank": (
@@ -605,6 +603,7 @@ def _build_quality_options(info: dict[str, Any]) -> list[QualityOption]:
             height=h,
             filesize=buckets[h]["filesize"],
             format_id=buckets[h]["format_id"],
+            clients=buckets[h].get("clients"),
         )
         for h in sorted_heights
     ]
@@ -666,27 +665,48 @@ def _download_attempts(
     """
     Download attempt chain: (format_selector, player_clients).
 
-    If the first attempt returns an empty/failed file (usually because it needs
-    a PO Token or a temporarily blocked YouTube client), the next attempts
-    try a different format/client so the user always ends up with a valid file
-    ends up with a valid file.
+    Tries all player_client combinations for the EXACT chosen quality first,
+    without silently degrading to a lower resolution (e.g. 360p) on attempt 1.
     """
 
+    attempts: list[tuple[str, Optional[list[str]]]] = []
+
     if quality.kind == "audio":
-        attempts = [(quality.format_selector(), None)]
+        selector = "bestaudio/best"
+        attempts.append((selector, None))
         if is_youtube:
-            attempts.append((quality.format_selector(), ["tv", "web_safari"]))
+            for combo in (["tv", "web_safari"], ["ios"], ["android"]):
+                if (selector, combo) not in attempts:
+                    attempts.append((selector, combo))
         return attempts
 
-    attempts = [(quality.format_selector(), None)]
+    exact_selector = quality.exact_format_selector()
 
     if is_youtube:
-        attempts.append((quality.format_selector(), ["tv", "web_safari"]))
+        # 1. Prioritize the client that originally exposed this format during extraction (if known)
+        if quality.clients:
+            attempts.append((exact_selector, quality.clients))
+
+        # 2. Try all known-good client combinations for the exact quality
+        for combo in _client_attempts():
+            item = (exact_selector, combo)
+            if item not in attempts:
+                attempts.append(item)
+
+        # 3. If exact format_id failed on all clients, allow same-height video with best audio
         if quality.height:
-            attempts.append(
-                (f"best[height<={quality.height}]/best", ["tv", "web_safari", "android", "ios"])
-            )
-        attempts.append(("best", None))
+            h = int(quality.height)
+            height_selector = f"bestvideo[height={h}]+bestaudio/bestvideo[height>={h-40}][height<={h+40}]+bestaudio/bestvideo[height<={h}]+bestaudio"
+            for combo in (quality.clients, ["tv", "web_safari"], None):
+                item = (height_selector, combo)
+                if item not in attempts:
+                    attempts.append(item)
+
+        # 4. Only if all else failed on all clients, fallback to best available video+audio
+        attempts.append(("bestvideo+bestaudio", None))
+    else:
+        attempts.append((exact_selector, None))
+        attempts.append(("bestvideo+bestaudio/best", None))
 
     return attempts
 
