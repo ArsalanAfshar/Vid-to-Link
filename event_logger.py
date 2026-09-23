@@ -75,6 +75,10 @@ class EventLogger:
             except Exception:  # noqa: BLE001
                 pass
 
+    def push(self, event: Event) -> None:
+        """Alias for log() for full compatibility."""
+        self.log(event)
+
     async def _persist(self, event: Event) -> None:
         try:
             if event.type in (

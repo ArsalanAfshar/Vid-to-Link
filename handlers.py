@@ -87,7 +87,7 @@ def _cleanup_task(user_id: int, keep_temp: bool = False) -> None:
 
 
 def _log(event_type: EventType, user_id: int, username: Optional[str], **kwargs: Any) -> None:
-    event_logger.push(
+    event_logger.log(
         Event(
             type=event_type,
             user_id=user_id,
@@ -122,15 +122,6 @@ async def _note_download_success(
     quality: Optional[str] = None,
     file_size: Optional[int] = None,
 ) -> None:
-    await database.add_download(
-        user_id=user_id,
-        username=username,
-        url=url or "",
-        platform=platform,
-        quality=quality,
-        file_size=file_size,
-        status="success",
-    )
     _log(event_type, user_id, username, platform=platform, url=url, quality=quality, file_size=file_size)
 
     # Check cooldown
@@ -228,6 +219,13 @@ async def _deliver_direct_link(
         [Button.inline("📋 مشخصات فایل دانلودی", f"linkinfo|{token}")],
     ]
 
+    extra_notice = ""
+    if is_owner(user_id) and ("localhost" in base_url or "127.0.0.1" in base_url):
+        extra_notice = (
+            "\n\n⚠️ **نکته مدیر:** دامنه عمومی ریل‌وی هنوز تنظیم نشده است. در پنل Railway از مسیر "
+            "Settings -> Networking روی **Generate Domain** بزنید تا لینک اینترنتی عمومی شود."
+        )
+
     await safe_edit(
         status_msg,
         "download_ready",
@@ -236,7 +234,7 @@ async def _deliver_direct_link(
         size=utils.format_bytes(file_size),
         expires_in=expires_in,
         expires_at=expires_at_str,
-        download_url=download_url,
+        download_url=download_url + extra_notice,
         buttons=buttons,
     )
 

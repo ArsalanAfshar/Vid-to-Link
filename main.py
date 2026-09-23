@@ -68,7 +68,15 @@ async def run() -> None:
     me = await main_client.get_me()
     logger.info("Main bot connected: @%s (ID: %s)", getattr(me, "username", "?"), me.id)
     logger.info("Bot Owner ID: %s", config.OWNER_ID)
-    logger.info("Base Download URL: %s", config.get_base_url())
+    base_url = config.get_base_url()
+    logger.info("Base Download URL: %s", base_url)
+    if "localhost" in base_url or "127.0.0.1" in base_url:
+        logger.warning(
+            "⚠️ Notice: Base Download URL is currently '%s'. "
+            "To enable external public downloads on Railway, navigate to your Service -> Settings -> "
+            "Public Networking -> 'Generate Domain' (or set BASE_URL in Railway Variables).",
+            base_url,
+        )
 
     tasks = [
         asyncio.create_task(main_client.run_until_disconnected()),
